@@ -2,9 +2,18 @@
 QuickBite daily pipeline (Joel)
 
 One run = one day's four files, chosen by the run's logical date ({{ ds }}).
-Part 1 (this version): create raw tables if missing -> wait for files in Drive
-                       -> copy to GCS landing -> load into BigQuery raw -> validate the load.
-Later parts will add: Dataform run, data-quality check, archive, notification.
+
+  create_raw_tables
+    -> for each file: wait in Drive -> copy to GCS landing -> load into raw -> validate the load
+  -> Dataform: compile -> run (staging, core, marts + assertions)
+  -> data-quality check on the result
+  -> archive the day's files (landing -> archive)
+  -> notify: one summary line, and fail the run if anything above failed
+
+Airflow Variables used (Admin -> Variables):
+  joel_project_id, joel_gcs_bucket, joel_drive_folder_id,
+  joel_raw_dataset, joel_core_dataset, joel_marts_dataset, joel_dataform_repo,
+  joel_dataform_service_account
 """
 
 import csv
@@ -12,13 +21,22 @@ import io
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from airflow.exceptions import AirflowException
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
 from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from airflow.providers.google.suite.sensors.drive import GoogleDriveFileExistenceSensor
 from airflow.providers.google.cloud.transfers.gdrive_to_gcs import GoogleDriveToGCSOperator
-from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
+from airflow.providers.google.cloud.operators.bigquery import (
+    BigQueryCheckOperator,
+    BigQueryInsertJobOperator,
+)
+from airflow.providers.google.cloud.operators.dataform import (
+    DataformCreateCompilationResultOperator,
+    DataformCreateWorkflowInvocationOperator,
+)
+from airflow.providers.google.cloud.transfers.gcs_to_gcs import GCSToGCSOperator
 
 # BigQuery region where joel_raw / joel_core / joel_marts live (same as the bucket).
 REGION = "us-central1"
@@ -120,6 +138,54 @@ def validate_raw(table, expected_columns, ds, **context):
     print(f"{table} {ds}: OK, header matches and {raw_count} rows in both file and raw")
 
 
+# Data-quality check after Dataform. BigQueryCheckOperator fails the task if ANY value
+# in the first row is FALSE (or 0 / NULL), so each column is one yes/no check.
+DQ_CHECK_SQL = """
+SELECT
+  -- 1. fct_orders has exactly one row per order
+  (SELECT COUNT(*) = COUNT(DISTINCT order_id)
+   FROM `{{ var.value.joel_project_id }}.{{ var.value.joel_core_dataset }}.fct_orders`) AS one_row_per_order,
+
+  -- 2. every order we received is accounted for: either valid (fct_orders) or rejected
+  (SELECT COUNT(DISTINCT order_id) FROM `{{ var.value.joel_project_id }}.{{ var.value.joel_core_dataset }}.stg_orders`)
+  = (SELECT COUNT(*) FROM `{{ var.value.joel_project_id }}.{{ var.value.joel_core_dataset }}.fct_orders`)
+  + (SELECT COUNT(*) FROM `{{ var.value.joel_project_id }}.{{ var.value.joel_core_dataset }}.rejected_orders`) AS every_order_accounted_for,
+
+  -- 3. no negative revenue anywhere in the daily mart
+  (SELECT COUNTIF(gross_revenue < 0) = 0
+   FROM `{{ var.value.joel_project_id }}.{{ var.value.joel_marts_dataset }}.mart_daily_city_revenue`) AS no_negative_revenue
+"""
+
+
+def notify(ds, **context):
+    """Last task: print one summary line for the day. If any task failed, fail this task
+    too, so the whole run shows red and the summary says exactly what broke."""
+    failed = sorted(
+        ti.task_id
+        for ti in context["dag_run"].get_task_instances()
+        if ti.state in ("failed", "upstream_failed")
+    )
+
+    numbers = "numbers unavailable"
+    try:
+        project = Variable.get("joel_project_id")
+        core = Variable.get("joel_core_dataset")
+        marts = Variable.get("joel_marts_dataset")
+        orders, revenue = BigQueryHook(use_legacy_sql=False, location=REGION).get_first(f"""
+            SELECT COALESCE(SUM(delivered_orders), 0), COALESCE(SUM(gross_revenue), 0)
+            FROM `{project}.{marts}.mart_daily_city_revenue` WHERE order_date = DATE '{ds}'""")
+        rejected = BigQueryHook(use_legacy_sql=False, location=REGION).get_first(f"""
+            SELECT COUNT(*) FROM `{project}.{core}.rejected_orders`
+            WHERE source_export_date = DATE '{ds}'""")[0]
+        numbers = f"{orders} delivered orders, revenue INR {revenue}, {rejected} rejected orders in this file"
+    except Exception as err:  # the summary should never hide the real failure
+        numbers = f"numbers unavailable ({err})"
+
+    if failed:
+        raise AirflowException(f"QuickBite {ds} FAILED. Failed tasks: {', '.join(failed)}. {numbers}")
+    print(f"QuickBite {ds} SUCCEEDED: {numbers}")
+
+
 with DAG(
     dag_id="joel_quickbite",
     start_date=datetime(2026, 10, 10),   # first day of data
@@ -139,6 +205,8 @@ with DAG(
         location=REGION,
         configuration={"query": {"query": CREATE_RAW_TABLES_SQL, "useLegacySql": False}},
     )
+
+    all_validations = []
 
     for table, columns in FILES.items():
         file_name = table + "_{{ ds }}.csv"   # e.g. orders_2026-10-11.csv
@@ -183,3 +251,57 @@ with DAG(
         )
 
         create_raw_tables >> wait_for_file >> copy_to_gcs >> load_to_raw >> validate
+        all_validations.append(validate)
+
+    # 5. Dataform, step 1: compile the code on the repository's main branch.
+    dataform_compile = DataformCreateCompilationResultOperator(
+        task_id="dataform_compile",
+        project_id="{{ var.value.joel_project_id }}",
+        region=REGION,
+        repository_id="{{ var.value.joel_dataform_repo }}",
+        compilation_result={"git_commitish": "main"},
+    )
+
+    # 6. Dataform, step 2: run everything (staging, core, marts, assertions) and wait.
+    #    The task fails if any Dataform action or assertion fails.
+    dataform_run = DataformCreateWorkflowInvocationOperator(
+        task_id="dataform_run",
+        project_id="{{ var.value.joel_project_id }}",
+        region=REGION,
+        repository_id="{{ var.value.joel_dataform_repo }}",
+        workflow_invocation={
+            "compilation_result": "{{ task_instance.xcom_pull(task_ids='dataform_compile')['name'] }}",
+            # The repository has strict act-as checks on, so every run must name the
+            # service account it runs as (the UI fills this in for you; the API doesn't).
+            "invocation_config": {"service_account": "{{ var.value.joel_dataform_service_account }}"},
+        },
+    )
+
+    # 7. Data-quality check on the result (see DQ_CHECK_SQL). No retries: bad data stays bad.
+    dq_check = BigQueryCheckOperator(
+        task_id="dq_check",
+        sql=DQ_CHECK_SQL,
+        use_legacy_sql=False,
+        location=REGION,
+        retries=0,
+    )
+
+    # 8. Move the day's files out of landing into archive (only if everything above passed).
+    archive_files = GCSToGCSOperator(
+        task_id="archive_files",
+        source_bucket="{{ var.value.joel_gcs_bucket }}",
+        source_object="capstone/joel/landing/{{ ds }}/*",
+        destination_bucket="{{ var.value.joel_gcs_bucket }}",
+        destination_object="capstone/joel/archive/{{ ds }}/",
+        move_object=True,
+    )
+
+    # 9. Summary / alert. 'all_done' = run even if something upstream failed.
+    notify_result = PythonOperator(
+        task_id="notify",
+        python_callable=notify,
+        trigger_rule="all_done",
+        retries=0,
+    )
+
+    all_validations >> dataform_compile >> dataform_run >> dq_check >> archive_files >> notify_result
