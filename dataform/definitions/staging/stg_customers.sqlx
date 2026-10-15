@@ -1,0 +1,16 @@
+config {
+  type: "view",
+  description: "Every customer version from every file, cleaned. Picking the latest version happens in dim_customers."
+}
+
+SELECT
+  TRIM(customer_id)                              AS customer_id,
+  TRIM(name)                                     AS customer_name,
+  LOWER(TRIM(email))                             AS email,
+  TRIM(phone)                                    AS phone,
+  TRIM(city)                                     AS city,
+  SAFE.PARSE_DATE('%Y-%m-%d', TRIM(signup_date)) AS signup_date,
+  ${helpers.parseDatetime("updated_at")}         AS updated_at,
+  _export_date,
+  _loaded_at
+FROM ${ref("customers")}

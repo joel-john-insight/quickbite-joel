@@ -1,0 +1,15 @@
+config {
+  type: "view",
+  description: "Restaurants from the LATEST snapshot only (rule 3: the latest snapshot is the truth), cleaned."
+}
+
+SELECT
+  TRIM(restaurant_id)                               AS restaurant_id,
+  TRIM(name)                                        AS restaurant_name,
+  TRIM(city)                                        AS city,
+  TRIM(cuisine)                                     AS cuisine,
+  LOWER(TRIM(is_active)) = 'true'                   AS is_active,
+  SAFE.PARSE_DATE('%Y-%m-%d', TRIM(onboarded_date)) AS onboarded_date,
+  _export_date                                      AS snapshot_date
+FROM ${ref("restaurants")}
+WHERE _export_date = (SELECT MAX(_export_date) FROM ${ref("restaurants")})

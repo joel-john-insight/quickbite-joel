@@ -1,0 +1,16 @@
+config {
+  type: "view",
+  description: "Every order version from every file, cleaned and standardised. Picking the latest version happens in fct_orders."
+}
+
+SELECT
+  TRIM(order_id)                                           AS order_id,
+  NULLIF(TRIM(customer_id), '')                            AS customer_id,      -- empty -> NULL (rule 4 rejects it)
+  NULLIF(TRIM(restaurant_id), '')                          AS restaurant_id,
+  ${helpers.parseDatetime("order_ts")}                     AS order_ts,         -- two date formats handled
+  LOWER(TRIM(status))                                      AS status,           -- rule 2: 'DELIVERED', ' delivered ' -> 'delivered'
+  COALESCE(NULLIF(TRIM(payment_method), ''), 'unknown')    AS payment_method,   -- rule 8
+  ${helpers.parseDatetime("updated_at")}                   AS updated_at,
+  _export_date,
+  _loaded_at
+FROM ${ref("orders")}

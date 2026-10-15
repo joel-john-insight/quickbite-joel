@@ -1,0 +1,10 @@
+config {
+  type: "view",
+  description: "Revenue per order = sum of quantity x unit_price over its valid item lines (rule 6). Used by all three marts."
+}
+
+SELECT
+  order_id,
+  SUM(line_amount) AS revenue
+FROM ${ref("fct_order_items")}
+GROUP BY order_id

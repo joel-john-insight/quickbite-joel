@@ -1,0 +1,30 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.marts_dataset,
+  description: "One row per restaurant (every restaurant, even with no orders): order counts by current status, cancellation rate and delivered revenue."
+}
+
+WITH per_restaurant AS (
+  SELECT
+    o.restaurant_id,
+    COUNT(*)                                                     AS total_orders,
+    COUNTIF(o.status = 'delivered')                              AS delivered_orders,
+    COUNTIF(o.status = 'cancelled')                              AS cancelled_orders,
+    SUM(IF(o.status = 'delivered', COALESCE(rev.revenue, 0), 0)) AS gross_revenue
+  FROM ${ref("fct_orders")} o
+  LEFT JOIN ${ref("order_revenue")} rev ON rev.order_id = o.order_id
+  GROUP BY o.restaurant_id
+)
+
+SELECT
+  r.restaurant_id,
+  r.restaurant_name,
+  r.city,
+  r.is_active,
+  COALESCE(p.total_orders, 0)     AS total_orders,
+  COALESCE(p.delivered_orders, 0) AS delivered_orders,
+  COALESCE(p.cancelled_orders, 0) AS cancelled_orders,
+  ROUND(COALESCE(SAFE_DIVIDE(p.cancelled_orders, p.total_orders), 0) * 100, 2) AS cancellation_rate_pct,
+  COALESCE(p.gross_revenue, 0)    AS gross_revenue
+FROM ${ref("dim_restaurants")} r
+LEFT JOIN per_restaurant p ON p.restaurant_id = r.restaurant_id

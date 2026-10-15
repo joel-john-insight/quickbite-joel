@@ -1,0 +1,14 @@
+config {
+  type: "view",
+  description: "Every item line from every file, cleaned. '₹220' -> 220. Invalid lines are removed in fct_order_items."
+}
+
+SELECT
+  TRIM(order_id)                                          AS order_id,
+  SAFE_CAST(TRIM(line_no) AS INT64)                       AS line_no,
+  TRIM(item_name)                                         AS item_name,
+  SAFE_CAST(TRIM(quantity) AS INT64)                      AS quantity,
+  SAFE_CAST(REPLACE(TRIM(unit_price), '₹', '') AS INT64)  AS unit_price,
+  _export_date,
+  _loaded_at
+FROM ${ref("order_items")}

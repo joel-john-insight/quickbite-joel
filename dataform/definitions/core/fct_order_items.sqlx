@@ -1,0 +1,35 @@
+config {
+  type: "incremental",
+  description: "One row per valid item line (order_id + line_no). Strategy: APPEND (items never change): new lines are inserted, existing lines are never updated, and lines already present are skipped so re-runs don't duplicate. Rule 5: lines with quantity or unit price <= 0 are excluded.",
+  assertions: {
+    uniqueKey: ["order_id", "line_no"],
+    nonNull: ["order_id", "line_no", "quantity", "unit_price"],
+    rowConditions: ["quantity > 0", "unit_price > 0"]
+  }
+}
+
+WITH incoming AS (
+  SELECT order_id, line_no, item_name, quantity, unit_price,
+         quantity * unit_price AS line_amount,
+         _export_date, _loaded_at
+  FROM ${ref("stg_order_items")}
+  WHERE quantity > 0 AND unit_price > 0                     -- rule 5 (NULL from a bad value also fails this)
+  ${when(incremental(), `AND ${helpers.newRowsOnly(self())}`)}
+),
+
+-- An item line counts once (rule 5): drop repeated lines such as O00952 line 1.
+deduped AS (
+  SELECT * EXCEPT (copy_rank)
+  FROM (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id, line_no ORDER BY _loaded_at) AS copy_rank
+    FROM incoming
+  )
+  WHERE copy_rank = 1
+)
+
+SELECT d.*
+FROM deduped d
+${when(incremental(), `
+LEFT JOIN ${self()} existing
+  ON existing.order_id = d.order_id AND existing.line_no = d.line_no
+WHERE existing.order_id IS NULL`)}

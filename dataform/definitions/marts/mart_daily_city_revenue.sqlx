@@ -1,0 +1,16 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.marts_dataset,
+  description: "One row per order date and restaurant city: delivered orders and their revenue (INR)."
+}
+
+SELECT
+  o.order_date,
+  r.city,
+  COUNT(*)                     AS delivered_orders,
+  COALESCE(SUM(rev.revenue), 0) AS gross_revenue
+FROM ${ref("fct_orders")} o
+JOIN ${ref("dim_restaurants")} r ON r.restaurant_id = o.restaurant_id
+LEFT JOIN ${ref("order_revenue")} rev ON rev.order_id = o.order_id
+WHERE o.status = 'delivered'                                  -- rule 6
+GROUP BY o.order_date, r.city

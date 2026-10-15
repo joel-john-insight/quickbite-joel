@@ -1,0 +1,8 @@
+defaultProject: sada-seed-2025-sandbox
+defaultLocation: us-central1
+defaultDataset: joel_core
+defaultAssertionDataset: joel_core
+dataformCoreVersion: 3.0.52
+vars:
+  raw_dataset: joel_raw
+  marts_dataset: joel_marts

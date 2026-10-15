@@ -1,0 +1,9 @@
+config {
+  type: "assertion",
+  description: "Fails if any order in fct_orders points to a restaurant that is not in dim_restaurants."
+}
+
+SELECT o.order_id, o.restaurant_id
+FROM ${ref("fct_orders")} o
+LEFT JOIN ${ref("dim_restaurants")} r ON r.restaurant_id = o.restaurant_id
+WHERE r.restaurant_id IS NULL

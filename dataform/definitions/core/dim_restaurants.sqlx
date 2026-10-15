@@ -1,0 +1,18 @@
+config {
+  type: "table",
+  description: "One row per restaurant, from the latest snapshot. Strategy: REPLACE (the file is a full snapshot every day). Inactive restaurants stay, so their past orders still count (rule 3).",
+  assertions: {
+    uniqueKey: ["restaurant_id"],
+    nonNull: ["restaurant_id", "restaurant_name", "city"]
+  }
+}
+
+SELECT
+  restaurant_id,
+  restaurant_name,
+  city,
+  cuisine,
+  is_active,
+  onboarded_date,
+  snapshot_date
+FROM ${ref("stg_restaurants")}

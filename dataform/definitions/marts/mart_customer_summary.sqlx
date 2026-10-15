@@ -1,0 +1,29 @@
+config {
+  type: "table",
+  schema: dataform.projectConfig.vars.marts_dataset,
+  description: "One row per customer (every customer, even with no orders): delivered orders, spend, first/last delivered order date, repeat flag."
+}
+
+WITH delivered AS (
+  SELECT
+    o.customer_id,
+    COUNT(*)                         AS delivered_orders,
+    SUM(COALESCE(rev.revenue, 0))    AS total_spend,
+    MIN(o.order_date)                AS first_order_date,
+    MAX(o.order_date)                AS last_order_date
+  FROM ${ref("fct_orders")} o
+  LEFT JOIN ${ref("order_revenue")} rev ON rev.order_id = o.order_id
+  WHERE o.status = 'delivered'
+  GROUP BY o.customer_id
+)
+
+SELECT
+  c.customer_id,
+  c.city                              AS current_city,
+  COALESCE(d.delivered_orders, 0)     AS delivered_orders,
+  COALESCE(d.total_spend, 0)          AS total_spend,
+  d.first_order_date,
+  d.last_order_date,
+  COALESCE(d.delivered_orders, 0) >= 2 AS is_repeat_customer
+FROM ${ref("dim_customers")} c
+LEFT JOIN delivered d ON d.customer_id = c.customer_id
