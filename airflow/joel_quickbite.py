@@ -3,13 +3,19 @@ QuickBite daily pipeline (Joel)
 
 One run = one day's four files, chosen by the run's logical date ({{ ds }}).
 Part 1 (this version): create raw tables if missing -> wait for files in Drive
-                       -> copy to GCS landing -> load into BigQuery raw.
+                       -> copy to GCS landing -> load into BigQuery raw -> validate the load.
 Later parts will add: Dataform run, data-quality check, archive, notification.
 """
 
+import csv
+import io
 from datetime import datetime, timedelta
 
 from airflow import DAG
+from airflow.models import Variable
+from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.hooks.bigquery import BigQueryHook
+from airflow.providers.google.cloud.hooks.gcs import GCSHook
 from airflow.providers.google.suite.sensors.drive import GoogleDriveFileExistenceSensor
 from airflow.providers.google.cloud.transfers.gdrive_to_gcs import GoogleDriveToGCSOperator
 from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
@@ -72,6 +78,48 @@ FROM `{{ var.value.joel_project_id }}.{{ var.value.joel_raw_dataset }}._load_{{ 
 COMMIT TRANSACTION;
 """
 
+def validate_raw(table, expected_columns, ds, **context):
+    """Ingestion check: did we copy this day's file into raw faithfully?
+
+    1. The file's header must equal the expected columns (catches renamed or reordered columns).
+    2. Rows in the file must equal rows in raw for this day (catches missing AND doubled rows).
+    3. Our label columns must be filled on every row (catches bugs in our own load SQL).
+    """
+    project = Variable.get("joel_project_id")
+    bucket = Variable.get("joel_gcs_bucket")
+    raw_dataset = Variable.get("joel_raw_dataset")
+    object_name = f"capstone/joel/landing/{ds}/{table}_{ds}.csv"
+
+    # Read the file from the GCS landing folder.
+    text = GCSHook().download(bucket_name=bucket, object_name=object_name).decode("utf-8-sig")
+    rows = list(csv.reader(io.StringIO(text, newline="")))
+    header = rows[0]
+    data_rows = [r for r in rows[1:] if any(cell.strip() for cell in r)]  # ignore blank lines
+
+    # Check 1: header
+    if header != expected_columns:
+        raise ValueError(f"{table} {ds}: columns changed. Expected {expected_columns}, got {header}")
+
+    # Count this day's rows in raw, and rows with missing label columns.
+    sql = f"""
+        SELECT COUNT(*),
+               COUNTIF(_source_file IS NULL OR _loaded_at IS NULL)
+        FROM `{project}.{raw_dataset}.{table}`
+        WHERE _export_date = DATE '{ds}'
+    """
+    raw_count, missing_labels = BigQueryHook(use_legacy_sql=False, location=REGION).get_first(sql)
+
+    # Check 2: row count
+    if raw_count != len(data_rows):
+        raise ValueError(f"{table} {ds}: file has {len(data_rows)} rows, raw has {raw_count}")
+
+    # Check 3: label columns
+    if missing_labels:
+        raise ValueError(f"{table} {ds}: {missing_labels} rows have empty _source_file/_loaded_at")
+
+    print(f"{table} {ds}: OK, header matches and {raw_count} rows in both file and raw")
+
+
 with DAG(
     dag_id="joel_quickbite",
     start_date=datetime(2026, 10, 10),   # first day of data
@@ -126,4 +174,12 @@ with DAG(
             },
         )
 
-        create_raw_tables >> wait_for_file >> copy_to_gcs >> load_to_raw
+        # 4. Check the load was faithful. No retries: a mismatch won't fix itself by retrying.
+        validate = PythonOperator(
+            task_id=f"validate_raw_{table}",
+            python_callable=validate_raw,
+            op_kwargs={"table": table, "expected_columns": columns},
+            retries=0,
+        )
+
+        create_raw_tables >> wait_for_file >> copy_to_gcs >> load_to_raw >> validate
